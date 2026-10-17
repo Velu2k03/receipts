@@ -58,7 +58,7 @@ export async function geminiJson(prompt: string, timeoutMs = 30000): Promise<any
 }
 
 // ---------------------------------------------------------------------------
-// DuckDuckGo search via the html endpoint (no external deps)
+// Tavily web search (AI-optimized search API)
 // ---------------------------------------------------------------------------
 type SearchResult = { title: string; href: string; body: string };
 
@@ -67,45 +67,51 @@ function stripTags(s: string): string {
     .replace(/&#x27;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim();
 }
 
-export async function searchDDG(query: string, maxResults = 8, timeoutMs = 15000): Promise<SearchResult[]> {
+export async function searchTavily(query: string, maxResults = 8, timeoutMs = 15000): Promise<SearchResult[]> {
+  const apiKey = Deno.env.get("TAVILY_API_KEY");
+  if (!apiKey) {
+    console.error("[Tavily] TAVILY_API_KEY environment variable is missing");
+    return [];
+  }
+
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+
   try {
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const res = await fetch(url, {
+    const res = await fetch("https://api.tavily.com/search", {
+      method: "POST",
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
-        "Accept": "text/html",
+        "Content-Type": "application/json",
       },
+      body: JSON.stringify({
+        api_key: apiKey,
+        query,
+        search_depth: "advanced",
+        max_results: maxResults,
+        include_answer: false,
+        include_raw_content: false,
+      }),
       signal: ctrl.signal,
     });
-    if (!res.ok) return [];
-    const html = await res.text();
-    const out: SearchResult[] = [];
-    const linkRe = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    const snipRe = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-    const links: Array<{ href: string; title: string }> = [];
-    let m: RegExpExecArray | null;
-    while ((m = linkRe.exec(html)) !== null && links.length < maxResults) {
-      let href = m[1];
-      const uddg = href.match(/uddg=([^&]+)/);
-      if (uddg) {
-        try { href = decodeURIComponent(uddg[1]); } catch { /* keep raw */ }
-      }
-      links.push({ href, title: stripTags(m[2]) });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      console.error("[Tavily]", query, `HTTP ${res.status}: ${errText}`.slice(0, 120));
+      return [];
     }
-    const snippets: string[] = [];
-    while ((m = snipRe.exec(html)) !== null && snippets.length < maxResults) {
-      snippets.push(stripTags(m[1]));
-    }
-    for (let i = 0; i < links.length; i++) {
-      if (!links[i].href || links[i].href.startsWith("//duckduckgo.com")) continue;
-      out.push({ title: links[i].title || "Web Source", href: links[i].href, body: snippets[i] ?? "" });
-    }
-    return out;
+
+    const data = await res.json();
+    const results = Array.isArray(data?.results) ? data.results : [];
+
+    return results
+      .filter((r: { url?: string }) => Boolean(r?.url))
+      .map((r: { title?: string; url: string; content?: string }) => ({
+        title: r.title || "Web Source",
+        href: r.url,
+        body: r.content || "",
+      }));
   } catch (e) {
-    console.error("[DDG]", query, String(e).slice(0, 120));
+    console.error("[Tavily]", query, String(e).slice(0, 120));
     return [];
   } finally {
     clearTimeout(timer);
@@ -236,7 +242,7 @@ async function handleAsk(question: string) {
   try {
     const plan = await geminiJson(
       `You are a research planner. Break down the following primary question into EXACTLY 3 specific, diverse sub-questions designed for web search engines to locate factual evidence.\n\nQuestion: "${question}"\n\nReturn JSON matching this format:\n{ "sub_questions": ["sub-question 1", "sub-question 2", "sub-question 3"] }`,
-      15000
+      60000
     );
     subQuestions = (plan.sub_questions ?? []).slice(0, 3);
   } catch (e) {
@@ -246,7 +252,7 @@ async function handleAsk(question: string) {
   await recordTrace(runId, step++, "planner", `Generated 3 sub-questions: ${JSON.stringify(subQuestions)}`);
 
   // (3) Searcher
-  const batches = await Promise.all(subQuestions.map((q) => searchDDG(q)));
+  const batches = await Promise.all(subQuestions.map((q) => searchTavily(q)));
   const seen = new Set<string>();
   const allResults: SearchResult[] = [];
   for (const b of batches) {
