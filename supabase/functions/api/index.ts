@@ -343,7 +343,14 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
 
   const url = new URL(req.url);
-  const path = url.pathname;
+  let path = url.pathname;
+  // Supabase gateways differ: strip whichever function prefix is present.
+  for (const prefix of ["/functions/v1/api", "/api"]) {
+    if (path === prefix || path.startsWith(prefix + "/")) {
+      path = path.slice(prefix.length) || "/";
+      break;
+    }
+  }
   console.log(req.method, path);
 
   try {
