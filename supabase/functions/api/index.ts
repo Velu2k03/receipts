@@ -29,32 +29,49 @@ function json(data: unknown, status = 200): Response {
 // Gemini helper (REST, JSON mode, with timeout)
 // ---------------------------------------------------------------------------
 export async function geminiJson(prompt: string, timeoutMs = 30000): Promise<any> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { responseMimeType: "application/json" },
-        }),
-        signal: ctrl.signal,
+  const delays = [3000, 6000];
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: "application/json" },
+          }),
+          signal: ctrl.signal,
+        }
+      );
+      if (res.status === 429 && attempt < delays.length) {
+        lastErr = new Error(`Gemini HTTP 429`);
+        await new Promise((r) => setTimeout(r, delays[attempt]));
+        continue;
       }
-    );
-    if (!res.ok) throw new Error(`Gemini HTTP ${res.status}`);
-    const data = await res.json();
-    let text: string = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-    text = text.trim();
-    if (text.startsWith("```")) {
-      text = text.replace(/^```(json)?/, "").replace(/```$/, "").trim();
+      if (!res.ok) throw new Error(`Gemini HTTP ${res.status}`);
+      const data = await res.json();
+      let text: string = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+      text = text.trim();
+      if (text.startsWith("```")) {
+        text = text.replace(/^```(json)?/, "").replace(/```$/, "").trim();
+      }
+      return JSON.parse(text);
+    } catch (e) {
+      lastErr = e;
+      if (String(e).includes("429") && attempt < delays.length) {
+        await new Promise((r) => setTimeout(r, delays[attempt]));
+        continue;
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
     }
-    return JSON.parse(text);
-  } finally {
-    clearTimeout(timer);
   }
+  throw lastErr;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +258,23 @@ async function handleAsk(question: string) {
   let subQuestions: string[] = [];
   try {
     const plan = await geminiJson(
-      `You are a research planner. Break down the following primary question into EXACTLY 3 specific, diverse sub-questions designed for web search engines to locate factual evidence.\n\nQuestion: "${question}"\n\nReturn JSON matching this format:\n{ "sub_questions": ["sub-question 1", "sub-question 2", "sub-question 3"] }`,
+      `You are the research planner for Receipts, an evidence-first question-answering system.
+
+Given the user's primary question, generate EXACTLY 3 distinct web-search questions that together gather reliable evidence needed to answer it.
+
+Requirements:
+- Each question must be independently searchable and focused on a specific factual issue.
+- Cover complementary angles, not three paraphrases of the same question.
+- Prefer concrete, search-friendly wording with relevant keywords and established terminology.
+- Investigate: (a) direct evidence for the main claim, (b) evidence quality, limitations, or conflicting findings, (c) conditions or factors that change the answer.
+- Do not assume the user's premise is true. Search for evidence that could support or contradict it.
+- Avoid vague phrases like 'tell me about' and unnecessary multi-part questions.
+- Do not answer the user's question. Generate search queries only.
+
+Return valid JSON with this exact structure:
+{ "sub_questions": ["question 1", "question 2", "question 3"] }
+
+User question: "${question}"`,
       60000
     );
     subQuestions = (plan.sub_questions ?? []).slice(0, 3);
@@ -252,7 +285,16 @@ async function handleAsk(question: string) {
   await recordTrace(runId, step++, "planner", `Generated 3 sub-questions: ${JSON.stringify(subQuestions)}`);
 
   // (3) Searcher
-  const batches = await Promise.all(subQuestions.map((q) => searchTavily(q)));
+  const settled = await Promise.allSettled(subQuestions.map((q) => searchTavily(q)));
+  const batches: SearchResult[][] = [];
+  settled.forEach((outcome, index) => {
+    if (outcome.status === "fulfilled") {
+      batches.push(outcome.value);
+    } else {
+      console.error("[search] rejected", index, String(outcome.reason).slice(0, 200));
+      batches.push([]);
+    }
+  });
   const seen = new Set<string>();
   const allResults: SearchResult[] = [];
   for (const b of batches) {
@@ -289,7 +331,29 @@ async function handleAsk(question: string) {
   let extracted: any[] = [];
   try {
     const res = await geminiJson(
-      `You are an evidence analyst. Read the search evidence below and answer the primary question:\nPrimary Question: "${question}"\n\nEvidence sources:\n${JSON.stringify(compact)}\n\nTasks:\n1. EXTRACT up to 6 atomic, factual claims directly relevant to answering the primary question. Every claim MUST be directly supported by at least one source snippet.\n2. LINK 1 to 3 citations per claim as {source_title, source_url, snippet} where 'snippet' is an EXACT quote taken from the source's snippet.\n3. SCORE confidence (0 to 100) per claim based on how many independent sources agree with it and how direct the evidence is.\n\nOutput format:\n{ "claims": [ { "claim_text": "...", "confidence": 85, "citations": [ { "source_title": "...", "source_url": "...", "snippet": "..." } ] } ] }`,
+      `You are the evidence extraction component of Receipts, an evidence-first research system.
+
+Extract up to 6 distinct, atomic factual claims that directly help answer the user's question, using ONLY the supplied search results.
+
+Evidence rules:
+- Extract a claim only when the supplied source text supports it.
+- Return FEWER than 6 claims when the evidence is limited. Two strong claims beat zero claims. Returning zero claims is appropriate ONLY when no useful factual claim can be verified from the supplied material.
+- Each claim must express one factual proposition.
+- Each claim must have 1 to 3 citations. ONE strong citation is sufficient for a narrowly scoped claim.
+- Each citation: {source_title, source_url, snippet} where snippet is an EXACT verbatim quote copied from the source's supplied snippet text.
+- Never invent quotes, URLs, statistics, or source details.
+- A snippet is evidence only for what it actually says. Do not infer beyond it.
+- Include conflicting or qualifying evidence when it changes the interpretation.
+- Assign confidence 0-100 based on strength of the supplied evidence, not plausibility.
+- Do not answer from prior knowledge.
+
+Return valid JSON:
+{ "claims": [ { "claim_text": "...", "confidence": 85, "citations": [ { "source_title": "...", "source_url": "...", "snippet": "..." } ] } ] }
+
+User question: "${question}"
+
+Supplied sources:
+${JSON.stringify(compact)}`,
       40000
     );
     extracted = (res.claims ?? []).slice(0, 6);
