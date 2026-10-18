@@ -29,7 +29,7 @@ function json(data: unknown, status = 200): Response {
 // Gemini helper (REST, JSON mode, with timeout)
 // ---------------------------------------------------------------------------
 export async function geminiJson(prompt: string, timeoutMs = 30000): Promise<any> {
-  const delays = [3000, 6000];
+  const delays = [5000, 15000];
   let lastErr: unknown = null;
   for (let attempt = 0; attempt <= delays.length; attempt++) {
     const ctrl = new AbortController();
@@ -47,8 +47,8 @@ export async function geminiJson(prompt: string, timeoutMs = 30000): Promise<any
           signal: ctrl.signal,
         }
       );
-      if (res.status === 429 && attempt < delays.length) {
-        lastErr = new Error(`Gemini HTTP 429`);
+      if ((res.status === 429 || res.status === 503) && attempt < delays.length) {
+        lastErr = new Error(`Gemini HTTP ${res.status}`);
         await new Promise((r) => setTimeout(r, delays[attempt]));
         continue;
       }
@@ -62,7 +62,8 @@ export async function geminiJson(prompt: string, timeoutMs = 30000): Promise<any
       return JSON.parse(text);
     } catch (e) {
       lastErr = e;
-      if (String(e).includes("429") && attempt < delays.length) {
+      const msg = String(e);
+      if ((msg.includes("429") || msg.includes("503")) && attempt < delays.length) {
         await new Promise((r) => setTimeout(r, delays[attempt]));
         continue;
       }
