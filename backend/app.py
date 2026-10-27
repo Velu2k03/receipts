@@ -137,6 +137,84 @@ class RunResponse(BaseModel):
     memory_claims: List[MemoryClaimSchema] = []
 
 # ==============================================================================
+# Quote-completeness validation
+# ==============================================================================
+# Oct 27 live defect: a snippet ending mid-sentence ("can be") was
+# stored as evidence. Nothing in either backend truncates snippets;
+# the extractor simply had no completeness check, so a partial
+# sentence from a truncated search snippet passed. This gate drops
+# such citations only. It never invents or guesses an ending.
+
+import re as _re
+
+def _normalize_quote_text(text: str) -> str:
+    return _re.sub(r"\s+", " ", str(text or "").strip()).strip("\"'“”").strip()
+
+def is_complete_quote(snippet: str, source_texts=None) -> bool:
+    """True only for a complete, verbatim quoted passage.
+
+    With source texts: the snippet must appear verbatim in one, and
+    must not stop mid-sentence. A snippet is complete when it ends
+    with terminal punctuation, or when the source text ends or has
+    terminal punctuation immediately after it (a sentence minus its
+    final period, a common search-snippet form). If the source
+    continues with another word after the snippet, the snippet was
+    cut mid-sentence and fails. Without source texts, terminal
+    punctuation alone is required.
+    """
+    raw = str(snippet or "").strip()
+    if len(raw) < 10 or raw.endswith(("...", "…")):
+        return False
+    core = _normalize_quote_text(raw)
+    if not core:
+        return False
+    if source_texts:
+        needle = _re.sub(r"\s+", " ", core).lower()
+        for hay_raw in source_texts:
+            hay = _re.sub(r"\s+", " ", str(hay_raw or "")).lower()
+            idx = hay.find(needle) if needle else -1
+            if idx < 0:
+                continue
+            after = hay[idx + len(needle):].strip()
+            if core[-1] in ".!?)”\"":
+                return True
+            if not after or after[0] in ".!?)”\"":
+                return True
+            return False
+        return False
+    return core[-1] in ".!?)”\""
+
+def validate_claims(claims, source_texts=None):
+    """Drop truncated citations only; drop claims left with none.
+
+    Returns (kept_claims, dropped_citation_count, dropped_claim_count).
+    The synthetic no-citation fallback claim is passed through unchanged
+    by callers, since it is not evidence and carries no citations.
+    """
+    kept = []
+    dropped_citations = 0
+    dropped_claims = 0
+    for claim in claims or []:
+        citations = claim.get("citations", []) if isinstance(claim, dict) else []
+        valid = []
+        for cite in citations:
+            snippet = cite.get("snippet", "") if isinstance(cite, dict) else ""
+            if is_complete_quote(snippet, source_texts):
+                valid.append(cite)
+            else:
+                dropped_citations += 1
+                print(f"[QuoteValidation] dropped truncated citation: {str(snippet)[:80]!r}")
+        if citations and not valid:
+            dropped_claims += 1
+            print("[QuoteValidation] dropped claim with no valid citations")
+            continue
+        new_claim = dict(claim) if isinstance(claim, dict) else claim
+        if isinstance(new_claim, dict):
+            new_claim["citations"] = valid
+        kept.append(new_claim)
+    return kept, dropped_citations, dropped_claims
+
+# ==============================================================================
 # DB Helper Functions (Non-blocking & Safe)
 # ==============================================================================
 
@@ -453,7 +531,7 @@ async def ask_pipeline(payload: AskRequest):
 
     Tasks:
     1. EXTRACT up to 6 atomic, factual claims directly relevant to answering the primary question. Every claim MUST be directly supported by at least one source snippet.
-    2. LINK 1 to 3 citations per claim as {{source_title, source_url, snippet}} where 'snippet' is an EXACT quote taken from the source's snippet.
+    2. LINK 1 to 3 citations per claim as {{source_title, source_url, snippet}} where 'snippet' is an EXACT quote taken from the source's snippet. The snippet MUST be a complete sentence, copied verbatim, ending with terminal punctuation, never truncated mid-sentence. If the supplied source snippet itself is truncated, do NOT use it as a citation.
     3. SCORE confidence (0 to 100) per claim based on how many independent sources agree with it and how direct the evidence is.
 
     Output format:
@@ -480,6 +558,15 @@ async def ask_pipeline(payload: AskRequest):
         extracted_claims_data = extraction_res.get("claims", [])[:6]
     except Exception as exc:
         print(f"[Extractor/Scorer Warning] Gemini failed: {exc}")
+
+    # Quote-completeness gate: drop truncated citations only, never
+    # invent or guess an ending. Claims left with no valid citation
+    # are dropped here, and the fallback below handles an empty set.
+    _source_texts = [r.get("body", "") for r in all_results]
+    extracted_claims_data, _dropped_cites, _dropped_claims = validate_claims(
+        extracted_claims_data, _source_texts)
+    if _dropped_cites or _dropped_claims:
+        print(f"[QuoteValidation] dropped {_dropped_cites} citations, {_dropped_claims} claims")
 
     # Fallback claim if extraction yielded nothing
     if not extracted_claims_data:

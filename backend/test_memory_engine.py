@@ -36,6 +36,9 @@ from memory_engine import Memory, MemoryStoreService, MemoryRetrievalService
 # H-MEM store + retrieval
 # ---------------------------------------------------------------------------
 
+# Snippets are complete verbatim sentences from the fake search bodies
+# below, as quote validation now requires. The previous fragments were
+# test-only shortcuts, not real search output.
 DESK_CLAIMS = [
     {
         "claim_text": "Standing desks reduced sedentary time by 1.2 hours per workday in a 2023 review.",
@@ -43,7 +46,7 @@ DESK_CLAIMS = [
         "citations": [{
             "source_title": "Standing desks: health benefits review",
             "source_url": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567/",
-            "snippet": "standing desks reduced sedentary time by 1.2 hours per workday",
+            "snippet": "A 2023 review found standing desks reduced sedentary time by 1.2 hours per workday.",
         }],
     },
     {
@@ -52,7 +55,7 @@ DESK_CLAIMS = [
         "citations": [{
             "source_title": "Cochrane review: sit-stand desks",
             "source_url": "https://www.cochranelibrary.com/cdsr/doi/10.1002/full",
-            "snippet": "effects on productivity remain uncertain",
+            "snippet": "Sit-stand desks probably reduce sitting time at work in the short term.",
         }],
     },
 ]

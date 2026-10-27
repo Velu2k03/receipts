@@ -75,6 +75,56 @@ export async function geminiJson(prompt: string, timeoutMs = 30000): Promise<any
   throw lastErr;
 }
 
+// Quote-completeness validation. Oct 27 live defect: a snippet ending
+// mid-sentence ("can be") was stored as evidence. Nothing truncates
+// snippets in code; the extractor had no completeness check. This gate
+// drops such citations only and never invents or guesses an ending.
+export function isCompleteQuote(snippet: string, sourceTexts?: string[]): boolean {
+  const raw = String(snippet ?? "").trim();
+  if (raw.length < 10 || raw.endsWith("...") || raw.endsWith("…")) return false;
+  const core = raw.replace(/\s+/g, " ").trim().replace(/^["'“”]+|["'“”]+$/g, "").trim();
+  if (!core) return false;
+  if (sourceTexts && sourceTexts.length) {
+    const needle = core.replace(/\s+/g, " ").toLowerCase();
+    for (const source of sourceTexts) {
+      const hay = String(source ?? "").replace(/\s+/g, " ").toLowerCase();
+      const idx = needle ? hay.indexOf(needle) : -1;
+      if (idx < 0) continue;
+      const after = hay.slice(idx + needle.length).trim();
+      if (".!?)”\"".includes(core[core.length - 1])) return true;
+      if (!after || ".!?)”\"".includes(after[0])) return true;
+      return false;
+    }
+    return false;
+  }
+  return ".!?)”\"".includes(core[core.length - 1]);
+}
+
+export function validateClaims(claims: any[], sourceTexts?: string[]): { kept: any[]; droppedCitations: number; droppedClaims: number } {
+  const kept: any[] = [];
+  let droppedCitations = 0;
+  let droppedClaims = 0;
+  for (const claim of claims ?? []) {
+    const citations = claim?.citations ?? [];
+    const valid = [];
+    for (const cite of citations) {
+      if (isCompleteQuote(cite?.snippet ?? "", sourceTexts)) {
+        valid.push(cite);
+      } else {
+        droppedCitations++;
+        console.error("[quote-validation] dropped truncated citation:", String(cite?.snippet ?? "").slice(0, 80));
+      }
+    }
+    if (citations.length && valid.length === 0) {
+      droppedClaims++;
+      console.error("[quote-validation] dropped claim with no valid citations");
+      continue;
+    }
+    kept.push({ ...claim, citations: valid });
+  }
+  return { kept, droppedCitations, droppedClaims };
+}
+
 // ---------------------------------------------------------------------------
 // Tavily web search (AI-optimized search API)
 // ---------------------------------------------------------------------------
@@ -341,7 +391,7 @@ Evidence rules:
 - Return FEWER than 6 claims when the evidence is limited. Two strong claims beat zero claims. Returning zero claims is appropriate ONLY when no useful factual claim can be verified from the supplied material.
 - Each claim must express one factual proposition.
 - Each claim must have 1 to 3 citations. ONE strong citation is sufficient for a narrowly scoped claim.
-- Each citation: {source_title, source_url, snippet} where snippet is an EXACT verbatim quote copied from the source's supplied snippet text.
+- Each citation: {source_title, source_url, snippet} where snippet is an EXACT verbatim quote copied from the source's supplied snippet text. The snippet MUST be a complete sentence, ending with terminal punctuation, never truncated mid-sentence. If the supplied snippet itself is truncated, do NOT use it as a citation.
 - Never invent quotes, URLs, statistics, or source details.
 - A snippet is evidence only for what it actually says. Do not infer beyond it.
 - Include conflicting or qualifying evidence when it changes the interpretation.
@@ -360,6 +410,16 @@ ${JSON.stringify(compact)}`,
     extracted = (res.claims ?? []).slice(0, 6);
   } catch (e) {
     console.error("[extractor]", String(e).slice(0, 150));
+  }
+  // Quote-completeness gate: drop truncated citations only, never
+  // invent or guess an ending. Claims left with no valid citation are
+  // dropped here; the fallback below handles an empty set.
+  {
+    const validated = validateClaims(extracted, allResults.map((r) => r.body));
+    extracted = validated.kept;
+    if (validated.droppedCitations || validated.droppedClaims) {
+      console.error(`[quote-validation] dropped ${validated.droppedCitations} citations, ${validated.droppedClaims} claims`);
+    }
   }
   if (extracted.length === 0) {
     extracted = [{
