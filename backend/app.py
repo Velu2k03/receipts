@@ -11,6 +11,10 @@ from supabase import create_client, Client
 import google.generativeai as genai
 from duckduckgo_search import DDGS
 
+from memory_engine import MemoryStoreService, MemoryRetrievalService
+from llm_provider import generate_json as provider_generate_json, meterless_configured
+import zetaris_client
+
 # primp 2.0.1 (bundled with duckduckgo-search 7.x) only accepts the plain
 # "chrome" impersonation profile; restrict DDGS's random pick accordingly.
 DDGS._impersonates = ("chrome",)
@@ -35,6 +39,26 @@ genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-3.8-flash")
 
 thread_pool = ThreadPoolExecutor(max_workers=10)
+
+# ==============================================================================
+# H-MEM Evidence Memory (Meterless) & Provider Setup
+# ==============================================================================
+
+# Local H-MEM engine: verified claims from completed runs are stored and
+# later questions retrieve relevant prior claims before the pipeline runs.
+# Persistence is SQLite under data/ plus a JSONL audit log under logs/, so
+# this works with zero external services (sample mode included).
+try:
+    memory_store = MemoryStoreService()
+    memory_retrieval = MemoryRetrievalService(memory_store)
+    print(f"[Memory] H-MEM store hydrated with {len(memory_store.all())} records.")
+except Exception as exc:
+    memory_store = None
+    memory_retrieval = None
+    print(f"[Memory Warning] H-MEM engine unavailable: {exc}")
+
+print(f"[Provider] Primary provider: {'Meterless Nightshift' if meterless_configured() else 'Gemini (Nightshift not configured)'}")
+print(f"[Zetaris] Data layer: {'configured at ' + str(zetaris_client.zetaris_base_url()) if zetaris_client.zetaris_configured() else 'not configured (evidence insights use the local engine)'}")
 
 # ==============================================================================
 # FastAPI Application
@@ -92,6 +116,16 @@ class TraceStepSchema(BaseModel):
     action: str
     detail: str
 
+class MemoryClaimSchema(BaseModel):
+    """A prior verified claim retrieved from the H-MEM evidence memory."""
+    memory_id: str
+    claim_text: str
+    confidence: int
+    score: float
+    question: str
+    run_id: Optional[str] = None
+    citations: List[CitationSchema] = []
+
 class RunResponse(BaseModel):
     id: str
     question: str
@@ -100,6 +134,7 @@ class RunResponse(BaseModel):
     answer: Optional[str] = None
     trace_steps: List[TraceStepSchema] = []
     claims: List[ClaimSchema] = []
+    memory_claims: List[MemoryClaimSchema] = []
 
 # ==============================================================================
 # DB Helper Functions (Non-blocking & Safe)
@@ -137,8 +172,8 @@ async def record_trace(run_id: str, step_order: int, action: str, detail: str) -
 # External Pipeline Tasks with Timeouts
 # ==============================================================================
 
-async def run_gemini_json(prompt: str, timeout_sec: float = 25.0) -> Any:
-    """Invokes Gemini 2.0 Flash in JSON mode with a strict timeout."""
+async def _gemini_json_direct(prompt: str, timeout_sec: float = 25.0) -> Any:
+    """The original Gemini JSON call, kept as the provider fallback."""
     def _call():
         return gemini_model.generate_content(
             prompt,
@@ -152,6 +187,79 @@ async def run_gemini_json(prompt: str, timeout_sec: float = 25.0) -> Any:
         if cleaned.startswith("json"):
             cleaned = cleaned[4:].strip()
     return json.loads(cleaned)
+
+async def run_gemini_json(prompt: str, timeout_sec: float = 25.0) -> Any:
+    """JSON generation routed via the provider layer.
+
+    Meterless Nightshift is primary when METERLESS_BASE_URL is set; any
+    Nightshift failure (or it being unset) falls back to Gemini.
+    """
+    return await provider_generate_json(prompt, _gemini_json_direct, timeout_sec=timeout_sec)
+
+# ==============================================================================
+# H-MEM Memory Helpers
+# ==============================================================================
+
+async def retrieve_memory_claims(question: str) -> List[MemoryClaimSchema]:
+    """Consult the evidence memory for prior verified claims.
+
+    Returns an empty list when the engine is unavailable or nothing is
+    relevant; memory must never break the /ask flow.
+    """
+    if memory_retrieval is None:
+        return []
+    try:
+        records, _trace = await asyncio.to_thread(memory_retrieval.query, question)
+    except Exception as exc:
+        print(f"[Memory Warning] Retrieval failed: {exc}")
+        return []
+    claims: List[MemoryClaimSchema] = []
+    for rec in records:
+        claims.append(MemoryClaimSchema(
+            memory_id=rec.get("id", ""),
+            claim_text=rec.get("content", ""),
+            confidence=int(round(float(rec.get("confidence", 0)) * 100)),
+            score=float(rec.get("score", 0.0)),
+            question=rec.get("question", ""),
+            run_id=rec.get("run_id"),
+            citations=[
+                CitationSchema(
+                    source_title=c.get("source_title", ""),
+                    source_url=c.get("source_url", ""),
+                    snippet=c.get("snippet", "")
+                )
+                for c in rec.get("citations", [])
+            ]
+        ))
+    return claims
+
+async def store_run_in_memory(
+    question: str,
+    run_id: str,
+    claims: List[ClaimSchema]
+) -> None:
+    """Persist a completed run's verified claims into the H-MEM store."""
+    if memory_store is None:
+        return
+    payload = [
+        {
+            "claim_text": c.claim_text,
+            "confidence": c.confidence,
+            "citations": [
+                {
+                    "source_title": cite.source_title,
+                    "source_url": cite.source_url,
+                    "snippet": cite.snippet
+                }
+                for cite in c.citations
+            ]
+        }
+        for c in claims
+    ]
+    try:
+        await asyncio.to_thread(memory_store.store_run, question, payload, run_id)
+    except Exception as exc:
+        print(f"[Memory Warning] Failed to store run in memory: {exc}")
 
 def _search_ddg(query: str, max_results: int = 8) -> List[Dict[str, str]]:
     """Performs synchronous DuckDuckGo search."""
@@ -185,7 +293,8 @@ async def health_check():
 @app.post("/ask", response_model=RunResponse, tags=["Receipts Pipeline"])
 async def ask_pipeline(payload: AskRequest):
     """
-    Executes the 8-stage evidence pipeline:
+    Executes the evidence pipeline:
+    0. Memory (H-MEM: retrieve prior verified claims for this question)
     1. Initialize run & trace
     2. Planner (break into 3 sub-questions)
     3. Searcher (DDG top 8 per query)
@@ -213,6 +322,17 @@ async def ask_pipeline(payload: AskRequest):
         )
 
     await record_trace(run_id, step_order, "init", f"Run initialized for question: '{question}'")
+    step_order += 1
+
+    # (1b) Memory: consult the H-MEM evidence memory BEFORE the pipeline
+    # runs, so prior verified claims ride along with this run's answer.
+    memory_claims = await retrieve_memory_claims(question)
+    await record_trace(
+        run_id,
+        step_order,
+        "memory",
+        f"Checked evidence memory: {len(memory_claims)} prior claims found"
+    )
     step_order += 1
 
     # (2) Planner: Generate 3 sub-questions
@@ -295,9 +415,10 @@ async def ask_pipeline(payload: AskRequest):
             answer=honest_answer,
             trace_steps=[
                 TraceStepSchema(step_order=1, action="init", detail="Run initialized"),
-                TraceStepSchema(step_order=2, action="planner", detail=json.dumps(sub_questions)),
-                TraceStepSchema(step_order=3, action="searcher", detail="No search results retrieved"),
-                TraceStepSchema(step_order=4, action="composer", detail=honest_answer),
+                TraceStepSchema(step_order=2, action="memory", detail=f"Checked evidence memory: {len(memory_claims)} prior claims found"),
+                TraceStepSchema(step_order=3, action="planner", detail=json.dumps(sub_questions)),
+                TraceStepSchema(step_order=4, action="searcher", detail="No search results retrieved"),
+                TraceStepSchema(step_order=5, action="composer", detail=honest_answer),
             ],
             claims=[
                 ClaimSchema(
@@ -308,7 +429,8 @@ async def ask_pipeline(payload: AskRequest):
                     citations=[],
                     overrides=[]
                 )
-            ]
+            ],
+            memory_claims=memory_claims
         )
 
     # (4, 5, 6) Extractor, Linker, and Scorer via Gemini
@@ -420,6 +542,15 @@ async def ask_pipeline(payload: AskRequest):
     await record_trace(run_id, step_order, "storage", f"Stored {len(hydrated_claims)} claims and citations.")
     step_order += 1
 
+    # (7b) Memory: store this run's verified claims in the H-MEM evidence
+    # memory so future questions can retrieve them. The synthetic fallback
+    # claim (no citations) is stored too only when it carries evidence;
+    # the plain fallback has none, so it is skipped by the store filter
+    # below: only claims with at least one citation are remembered.
+    evidenced_claims = [c for c in hydrated_claims if c.citations]
+    if evidenced_claims:
+        await store_run_in_memory(question, run_id, evidenced_claims)
+
     # (8) Composer: 2 to 3 sentence direct answer to original question
     composer_prompt = f"""
     You are the final synthesizer for 'Receipts'.
@@ -450,8 +581,11 @@ async def ask_pipeline(payload: AskRequest):
 
     await record_trace(run_id, step_order, "composer", composed_answer)
 
-    # Return the complete run object
-    return await get_run_details(run_id, direct_answer=composed_answer)
+    # Return the complete run object, with the memory claims retrieved at
+    # the start of this run attached as their own response section.
+    response = await get_run_details(run_id, direct_answer=composed_answer)
+    response.memory_claims = memory_claims
+    return response
 
 
 @app.get("/runs/{run_id}", response_model=RunResponse, tags=["Receipts Pipeline"])
@@ -574,6 +708,62 @@ async def override_claim(claim_id: str, payload: OverrideRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to record override: {exc}"
         )
+
+
+# ==============================================================================
+# Zetaris Evidence Insights
+# ==============================================================================
+
+@app.get("/evidence/insights", tags=["Evidence Insights"])
+async def evidence_insights(limit: int = 5):
+    """Aggregate questions over the evidence store.
+
+    When Zetaris is configured (ZETARIS_BASE_URL + ZETARIS_API_KEY),
+    the aggregates are answered with Lightning SQL through the Zetaris
+    virtual data layer over the exported evidence CSVs. Otherwise the
+    same aggregates are computed locally from the same exported rows.
+    The serving engine is always named in the response, and a Zetaris
+    failure falls back to the local engine with the reason recorded.
+    """
+    limit = max(1, min(int(limit), 50))
+    records = [m.to_dict() for m in memory_store.all()] if memory_store else []
+    rows = zetaris_client.build_evidence_rows(records)
+
+    # Keep the exported files current so a registered Zetaris instance
+    # reads the latest evidence store.
+    try:
+        await asyncio.to_thread(zetaris_client.export_evidence_csvs, records)
+    except Exception as exc:
+        print(f"[Zetaris Warning] Evidence export failed: {exc}")
+
+    engine = "local"
+    fallback_reason: Optional[str] = None
+    insights: Optional[Dict[str, Any]] = None
+    if zetaris_client.zetaris_configured():
+        try:
+            insights = await asyncio.to_thread(zetaris_client.zetaris_insights, limit)
+            engine = "zetaris"
+        except Exception as exc:
+            fallback_reason = str(exc)
+            print(f"[Zetaris Warning] Insights query failed, using local engine: {exc}")
+    if insights is None:
+        insights = zetaris_client.local_insights(rows, limit)
+
+    zetaris_client.log_zetaris_event("insights", {
+        "engine": engine,
+        "totals": insights["totals"],
+        "fallback_reason": fallback_reason,
+    })
+
+    response: Dict[str, Any] = {
+        "engine": engine,
+        "database": zetaris_client.DATABASE_NAME,
+        "zetaris_configured": zetaris_client.zetaris_configured(),
+        **insights,
+    }
+    if fallback_reason:
+        response["fallback_reason"] = fallback_reason
+    return response
 
 
 # ==============================================================================
