@@ -98,6 +98,27 @@ README sponsor section, `metadata.json`, pitch deck v2, demo video.
 - No Unified Semantic Layer document, DDL, or data-quality rule
   evidence exists yet for the Zetaris scoring criteria published
   Oct 27. That is a gap, stated in `docs/ARCHITECTURE.md`, not hidden.
+- Confidence units: the API, DB, and frontend badge are 0..100.
+  H-MEM records are 0..1 internally and are converted at store
+  (`/100`) and retrieve/CSV export (`*100`); the Zetaris SQL average
+  runs over the 0..100 CSV column, so it stays 0..100. A model float
+  on the 0..1 scale is normalized to 0..100 at ingestion only.
+- Quote validation is per source: a citation is checked against its
+  own source URL's body, not against a pooled list of all sources,
+  in both backends. A quote complete in source B does not pass for
+  source C.
+- Fallback claims carry no citations, confidence 0, and
+  `evidence_status: "insufficient_evidence"` in the API response.
+  They are never stored in H-MEM and are never fed to the composer
+  as verified claims; with no evidenced claims the answer is the
+  insufficient-evidence line, not a synthesis of the fallback.
+- Confidence after filtering is not recomputed. The score is the
+  model's pre-filter score; dropping a citation does not rescale it,
+  so read it as a pre-filter score and weigh the surviving citation
+  count alongside it.
+- The no-search-results branch returns the same DB trace as the
+  normal flow (init, memory, planner, searcher, composer). No
+  extractor or storage step is shown because neither ran.
 
 ## Sponsor integrations (Open Agent Hackathon)
 
