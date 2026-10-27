@@ -75,6 +75,17 @@ export async function geminiJson(prompt: string, timeoutMs = 30000): Promise<any
   throw lastErr;
 }
 
+// Confidence is 0..100 everywhere in this function: the extractor
+// prompt, the claims table, and the frontend badge. A model float on
+// the 0..1 scale is rescaled only when it is a genuine non-integer
+// float, so a score of 1 stays 1 percent, not 100.
+export function normalizeConfidence(value: unknown): number {
+  const raw = typeof value === "number" ? value : parseFloat(String(value ?? 50));
+  if (!Number.isFinite(raw)) return 50;
+  if (raw > 0 && raw <= 1 && !Number.isInteger(raw)) return Math.round(raw * 100);
+  return Math.max(0, Math.min(100, Math.round(raw)));
+}
+
 // Quote-completeness validation. Oct 27 live defect: a snippet ending
 // mid-sentence ("can be") was stored as evidence. Nothing truncates
 // snippets in code; the extractor had no completeness check. This gate
@@ -84,7 +95,11 @@ export function isCompleteQuote(snippet: string, sourceTexts?: string[]): boolea
   if (raw.length < 10 || raw.endsWith("...") || raw.endsWith("…")) return false;
   const core = raw.replace(/\s+/g, " ").trim().replace(/^["'“”]+|["'“”]+$/g, "").trim();
   if (!core) return false;
-  if (sourceTexts && sourceTexts.length) {
+  if (sourceTexts !== undefined) {
+    // An empty list means "no matching source", not "no sources
+    // given": it must fail closed, never fall through to the
+    // terminal-punctuation-only check below.
+    if (sourceTexts.length === 0) return false;
     const needle = core.replace(/\s+/g, " ").toLowerCase();
     for (const source of sourceTexts) {
       const hay = String(source ?? "").replace(/\s+/g, " ").toLowerCase();
@@ -100,7 +115,7 @@ export function isCompleteQuote(snippet: string, sourceTexts?: string[]): boolea
   return ".!?)”\"".includes(core[core.length - 1]);
 }
 
-export function validateClaims(claims: any[], sourceTexts?: string[]): { kept: any[]; droppedCitations: number; droppedClaims: number } {
+export function validateClaims(claims: any[], sourceTexts?: string[], sourceByUrl?: Record<string, string>): { kept: any[]; droppedCitations: number; droppedClaims: number } {
   const kept: any[] = [];
   let droppedCitations = 0;
   let droppedClaims = 0;
@@ -108,7 +123,17 @@ export function validateClaims(claims: any[], sourceTexts?: string[]): { kept: a
     const citations = claim?.citations ?? [];
     const valid = [];
     for (const cite of citations) {
-      if (isCompleteQuote(cite?.snippet ?? "", sourceTexts)) {
+      // Per-source check when a URL map is given: a quote complete in
+      // source B must not pass for a citation pointing at source C,
+      // and an unknown URL fails closed. Confidence is not recomputed
+      // after filtering; it stays the model's pre-filter score.
+      let texts = sourceTexts;
+      if (sourceByUrl) {
+        const url = String(cite?.source_url ?? "");
+        const body = sourceByUrl[url] ?? sourceByUrl[url.replace(/\/$/, "")];
+        texts = body === undefined ? [] : [body];
+      }
+      if (isCompleteQuote(cite?.snippet ?? "", texts)) {
         valid.push(cite);
       } else {
         droppedCitations++;
@@ -245,12 +270,14 @@ async function getRunDetails(runId: string, directAnswer?: string) {
 
   const claims = (claimsRows ?? []).map((c: any) => {
     const cid = String(c.id);
+    const claimCitations = citsByClaim[cid] ?? [];
     return {
       id: cid,
       run_id: runId,
       claim_text: c.claim_text,
       confidence: c.confidence,
-      citations: (citsByClaim[cid] ?? []).map((s: any) => ({
+      evidence_status: claimCitations.length === 0 && c.confidence === 0 ? "insufficient_evidence" : null,
+      citations: claimCitations.map((s: any) => ({
         id: String(s.id),
         claim_id: cid,
         source_title: s.source_title,
@@ -415,7 +442,9 @@ ${JSON.stringify(compact)}`,
   // invent or guess an ending. Claims left with no valid citation are
   // dropped here; the fallback below handles an empty set.
   {
-    const validated = validateClaims(extracted, allResults.map((r) => r.body));
+    const sourceByUrl: Record<string, string> = {};
+    for (const r of allResults) sourceByUrl[r.href] = r.body;
+    const validated = validateClaims(extracted, undefined, sourceByUrl);
     extracted = validated.kept;
     if (validated.droppedCitations || validated.droppedClaims) {
       console.error(`[quote-validation] dropped ${validated.droppedCitations} citations, ${validated.droppedClaims} claims`);
@@ -424,7 +453,7 @@ ${JSON.stringify(compact)}`,
   if (extracted.length === 0) {
     extracted = [{
       claim_text: "Web search returned documents, but no verifiable atomic claims could be derived.",
-      confidence: 10,
+      confidence: 0,
       citations: [],
     }];
   }
@@ -434,7 +463,7 @@ ${JSON.stringify(compact)}`,
   // (7) Storage
   for (const c of extracted) {
     const claimText = String(c.claim_text ?? "").trim();
-    const confidence = Math.max(0, Math.min(100, parseInt(c.confidence ?? 50, 10) || 50));
+    const confidence = normalizeConfidence(c.confidence);
     const claimRow = await dbInsert("claims", { run_id: runId, claim_text: claimText, confidence });
     for (const s of (c.citations ?? []).slice(0, 3)) {
       await dbInsert("citations", {
@@ -447,17 +476,23 @@ ${JSON.stringify(compact)}`,
   }
   await recordTrace(runId, step++, "storage", `Stored ${extracted.length} claims and citations.`);
 
-  // (8) Composer
+  // (8) Composer, fed evidenced claims only. With none, the fallback
+  // text is not a claim to synthesize from, so answer honestly.
+  const evidencedExtracted = extracted.filter((c: any) => (c.citations ?? []).length > 0);
   let answer = "";
-  try {
-    const comp = await geminiJson(
-      `You are the final synthesizer for 'Receipts'. Write a concise, 2 to 3 sentence direct answer to the user's question, relying ONLY on the verified factual claims below.\n\nQuestion: "${question}"\nVerified Claims:\n${JSON.stringify(extracted.map((c: any) => c.claim_text))}\n\nReturn JSON:\n{ "answer": "2 to 3 sentences answering the question directly." }`,
-      15000
-    );
-    answer = String(comp.answer ?? "").trim();
-  } catch (e) {
-    console.error("[composer]", String(e).slice(0, 120));
-    answer = extracted.slice(0, 2).map((c: any) => c.claim_text).join(" ");
+  if (evidencedExtracted.length === 0) {
+    answer = "Evidence was insufficient to provide a verified answer to this question.";
+  } else {
+    try {
+      const comp = await geminiJson(
+        `You are the final synthesizer for 'Receipts'. Write a concise, 2 to 3 sentence direct answer to the user's question, relying ONLY on the verified factual claims below.\n\nQuestion: "${question}"\nVerified Claims:\n${JSON.stringify(evidencedExtracted.map((c: any) => c.claim_text))}\n\nReturn JSON:\n{ "answer": "2 to 3 sentences answering the question directly." }`,
+        15000
+      );
+      answer = String(comp.answer ?? "").trim();
+    } catch (e) {
+      console.error("[composer]", String(e).slice(0, 120));
+      answer = evidencedExtracted.slice(0, 2).map((c: any) => c.claim_text).join(" ");
+    }
   }
 
   await supabase.from("runs").update({ status: "done" }).eq("id", runId);

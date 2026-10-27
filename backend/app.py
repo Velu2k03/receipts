@@ -108,6 +108,11 @@ class ClaimSchema(BaseModel):
     confidence: int
     citations: List[CitationSchema] = []
     overrides: List[OverrideSchema] = []
+    # Derived at read time, not a DB column: set only for a claim with
+    # no citations and confidence 0, i.e. the insufficient-evidence
+    # fallback. Evidenced claims leave this unset rather than claiming
+    # a verification guarantee the pipeline cannot prove.
+    evidence_status: Optional[str] = None
 
 class TraceStepSchema(BaseModel):
     id: Optional[str] = None
@@ -147,6 +152,24 @@ class RunResponse(BaseModel):
 
 import re as _re
 
+def normalize_confidence(value, default: int = 50) -> int:
+    """Normalize a model confidence to the 0..100 API scale.
+
+    The contract everywhere else is 0..100: the extractor prompt,
+    ClaimSchema, the DB column, and the frontend badge. A model that
+    returns a float on the 0..1 scale (e.g. 0.85) used to be truncated
+    to 0 by int(); only a genuine float in (0, 1] is rescaled. An int
+    is left alone, so a model score of 1 stays 1 percent, not 100.
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, float) and 0.0 < value <= 1.0:
+        return int(round(value * 100))
+    try:
+        return max(0, min(100, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return default
+
 def _normalize_quote_text(text: str) -> str:
     return _re.sub(r"\s+", " ", str(text or "").strip()).strip("\"'“”").strip()
 
@@ -168,7 +191,12 @@ def is_complete_quote(snippet: str, source_texts=None) -> bool:
     core = _normalize_quote_text(raw)
     if not core:
         return False
-    if source_texts:
+    if source_texts is not None:
+        # An empty list means "no matching source", not "no sources
+        # given": it must fail closed, never fall through to the
+        # terminal-punctuation-only check below.
+        if not source_texts:
+            return False
         needle = _re.sub(r"\s+", " ", core).lower()
         for hay_raw in source_texts:
             hay = _re.sub(r"\s+", " ", str(hay_raw or "")).lower()
@@ -184,12 +212,32 @@ def is_complete_quote(snippet: str, source_texts=None) -> bool:
         return False
     return core[-1] in ".!?)”\""
 
-def validate_claims(claims, source_texts=None):
-    """Drop truncated citations only; drop claims left with none.
+def _bodies_for_citation(cite, source_by_url, source_texts):
+    """Source bodies a citation may be validated against, per source.
+
+    When a URL-to-body map is given, a citation is checked only
+    against its own source's body. A quote that is complete in source
+    B must not pass for a citation pointing at source C, and a
+    citation whose URL is not in the map fails closed. The pooled
+    source_texts path is kept only for callers/tests without a map.
+    """
+    if source_by_url is not None:
+        url = cite.get("source_url", "") if isinstance(cite, dict) else ""
+        for key in (url, url.rstrip("/")):
+            if key in source_by_url:
+                return [source_by_url[key]]
+        return []
+    return source_texts
+
+def validate_claims(claims, source_texts=None, source_by_url=None):
+    """Drop truncated or misattributed citations only; drop claims left with none.
 
     Returns (kept_claims, dropped_citation_count, dropped_claim_count).
     The synthetic no-citation fallback claim is passed through unchanged
     by callers, since it is not evidence and carries no citations.
+    Confidence is deliberately NOT recomputed here: it is the model's
+    pre-filter score, and dropping a citation does not rescale it.
+    The surviving citation count is what the reader should weigh.
     """
     kept = []
     dropped_citations = 0
@@ -199,7 +247,7 @@ def validate_claims(claims, source_texts=None):
         valid = []
         for cite in citations:
             snippet = cite.get("snippet", "") if isinstance(cite, dict) else ""
-            if is_complete_quote(snippet, source_texts):
+            if is_complete_quote(snippet, _bodies_for_citation(cite, source_by_url, source_texts)):
                 valid.append(cite)
             else:
                 dropped_citations += 1
@@ -471,7 +519,7 @@ async def ask_pipeline(payload: AskRequest):
     # Edge Case: If zero or empty search results
     if not all_results:
         honest_claim_text = "Insufficient evidence was found on the web to substantiate any factual claims."
-        claim_rec = await db_insert("claims", {
+        await db_insert("claims", {
             "run_id": run_id,
             "claim_text": honest_claim_text,
             "confidence": 0
@@ -486,30 +534,13 @@ async def ask_pipeline(payload: AskRequest):
 
         await record_trace(run_id, step_order, "composer", honest_answer)
 
-        return RunResponse(
-            id=run_id,
-            question=question,
-            status="done",
-            answer=honest_answer,
-            trace_steps=[
-                TraceStepSchema(step_order=1, action="init", detail="Run initialized"),
-                TraceStepSchema(step_order=2, action="memory", detail=f"Checked evidence memory: {len(memory_claims)} prior claims found"),
-                TraceStepSchema(step_order=3, action="planner", detail=json.dumps(sub_questions)),
-                TraceStepSchema(step_order=4, action="searcher", detail="No search results retrieved"),
-                TraceStepSchema(step_order=5, action="composer", detail=honest_answer),
-            ],
-            claims=[
-                ClaimSchema(
-                    id=str(claim_rec.get("id")),
-                    run_id=run_id,
-                    claim_text=honest_claim_text,
-                    confidence=0,
-                    citations=[],
-                    overrides=[]
-                )
-            ],
-            memory_claims=memory_claims
-        )
+        # Return the DB trace, not a hardcoded copy: the normal flow
+        # and this branch then render identically (init, memory,
+        # planner, searcher, composer, in order). No extractor or
+        # storage step is recorded because neither ran.
+        response = await get_run_details(run_id, direct_answer=honest_answer)
+        response.memory_claims = memory_claims
+        return response
 
     # (4, 5, 6) Extractor, Linker, and Scorer via Gemini
     # Compact search results payload for context
@@ -562,17 +593,19 @@ async def ask_pipeline(payload: AskRequest):
     # Quote-completeness gate: drop truncated citations only, never
     # invent or guess an ending. Claims left with no valid citation
     # are dropped here, and the fallback below handles an empty set.
-    _source_texts = [r.get("body", "") for r in all_results]
+    _source_by_url = {r.get("href", ""): r.get("body", "") for r in all_results}
     extracted_claims_data, _dropped_cites, _dropped_claims = validate_claims(
-        extracted_claims_data, _source_texts)
+        extracted_claims_data, source_by_url=_source_by_url)
     if _dropped_cites or _dropped_claims:
         print(f"[QuoteValidation] dropped {_dropped_cites} citations, {_dropped_claims} claims")
 
-    # Fallback claim if extraction yielded nothing
+    # Fallback claim if extraction yielded nothing. Confidence 0, not
+    # 10: a claim with no citations is not weak evidence, it is no
+    # evidence, and it must never read as a low-confidence finding.
     if not extracted_claims_data:
         extracted_claims_data = [{
             "claim_text": "Web search returned documents, but no verifiable atomic claims could be derived.",
-            "confidence": 10,
+            "confidence": 0,
             "citations": []
         }]
 
@@ -588,7 +621,7 @@ async def ask_pipeline(payload: AskRequest):
     hydrated_claims: List[ClaimSchema] = []
     for c_data in extracted_claims_data:
         claim_text = c_data.get("claim_text", "").strip()
-        confidence = int(c_data.get("confidence", 50))
+        confidence = normalize_confidence(c_data.get("confidence", 50))
         citations_data = c_data.get("citations", [])[:3]
 
         claim_rec = await db_insert("claims", {
@@ -630,35 +663,42 @@ async def ask_pipeline(payload: AskRequest):
     step_order += 1
 
     # (7b) Memory: store this run's verified claims in the H-MEM evidence
-    # memory so future questions can retrieve them. The synthetic fallback
-    # claim (no citations) is stored too only when it carries evidence;
-    # the plain fallback has none, so it is skipped by the store filter
-    # below: only claims with at least one citation are remembered.
+    # memory so future questions can retrieve them. Only claims with at
+    # least one citation are remembered, here and again inside
+    # store_run, so a no-citation fallback can never enter memory as
+    # verified evidence.
     evidenced_claims = [c for c in hydrated_claims if c.citations]
     if evidenced_claims:
         await store_run_in_memory(question, run_id, evidenced_claims)
 
-    # (8) Composer: 2 to 3 sentence direct answer to original question
-    composer_prompt = f"""
+    # (8) Composer: 2 to 3 sentence direct answer to original question.
+    # The composer is fed evidenced claims only. When there are none,
+    # the fallback text is not a claim to synthesize from, so the
+    # answer is the honest insufficient-evidence line, not a model
+    # rewrite of the fallback.
+    if not evidenced_claims:
+        composed_answer = "Evidence was insufficient to provide a verified answer to this question."
+    else:
+        composer_prompt = f"""
     You are the final synthesizer for 'Receipts'.
     Write a concise, 2 to 3 sentence direct answer to the user's question, relying ONLY on the verified factual claims below.
 
     Question: "{question}"
     Verified Claims:
-    {json.dumps([c.claim_text for c in hydrated_claims], indent=2)}
+    {json.dumps([c.claim_text for c in evidenced_claims], indent=2)}
 
     Return JSON:
     {{
         "answer": "2 to 3 sentences answering the question directly."
     }}
     """
-    composed_answer = ""
-    try:
-        composer_res = await run_gemini_json(composer_prompt, timeout_sec=15.0)
-        composed_answer = composer_res.get("answer", "").strip()
-    except Exception as exc:
-        print(f"[Composer Warning] Gemini composer failed: {exc}")
-        composed_answer = " ".join([c.claim_text for c in hydrated_claims[:2]])
+        composed_answer = ""
+        try:
+            composer_res = await run_gemini_json(composer_prompt, timeout_sec=15.0)
+            composed_answer = composer_res.get("answer", "").strip()
+        except Exception as exc:
+            print(f"[Composer Warning] Gemini composer failed: {exc}")
+            composed_answer = " ".join([c.claim_text for c in evidenced_claims[:2]])
 
     # Mark run done in Supabase
     try:
@@ -743,13 +783,16 @@ async def get_run_details(run_id: str, direct_answer: Optional[str] = None) -> R
     claims_list: List[ClaimSchema] = []
     for c in claims_data:
         cid = str(c["id"])
+        claim_citations = citations_by_claim.get(cid, [])
+        claim_confidence = int(c.get("confidence", 0))
         claims_list.append(ClaimSchema(
             id=cid,
             run_id=run_id,
             claim_text=c.get("claim_text", ""),
-            confidence=int(c.get("confidence", 0)),
-            citations=citations_by_claim.get(cid, []),
-            overrides=overrides_by_claim.get(cid, [])
+            confidence=claim_confidence,
+            citations=claim_citations,
+            overrides=overrides_by_claim.get(cid, []),
+            evidence_status="insufficient_evidence" if not claim_citations and claim_confidence == 0 else None
         ))
 
     trace_steps_list: List[TraceStepSchema] = []

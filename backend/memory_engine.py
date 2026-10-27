@@ -267,14 +267,21 @@ class MemoryStoreService:
 
         ``claims`` items follow the pipeline shape: claim_text, confidence
         (0..100), citations [{source_title, source_url, snippet}].
-        Returns the stored Memory records.
+        Returns the stored Memory records. Defense in depth for the
+        pipeline filter: a claim with no citations is skipped here
+        too, so an uncited fallback can never be stored as a verified
+        memory even if a caller forgets to filter.
         """
         ts = created_at_ms or _now_ms()
         stored: List[Memory] = []
+        skipped_uncited = 0
         q_tokens = tokenize(question)
         for claim in claims:
             text = (claim.get("claim_text") or "").strip()
             if not text:
+                continue
+            if not claim.get("citations"):
+                skipped_uncited += 1
                 continue
             confidence = _clamp01(float(claim.get("confidence", 0)) / 100.0)
             citations = [
@@ -314,6 +321,7 @@ class MemoryStoreService:
                 "run_id": run_id,
                 "question": question,
                 "stored": len(stored),
+                "skipped_uncited": skipped_uncited,
                 "memory_ids": [m.id for m in stored],
             },
         )
