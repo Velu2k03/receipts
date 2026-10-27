@@ -35,13 +35,69 @@ can mark bad evidence.
 
 ## Architecture
 
+Two runtimes, kept apart on purpose. The hosted demo is served by the
+Supabase Edge Function, not by the Python pipeline. Full detail,
+including the trace steps for each runtime, is in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Samples, with each one
+labelled live, test fixture, or response shape, are in
+[`docs/SAMPLES.md`](docs/SAMPLES.md).
+
+```
+User question
+  -> Next.js frontend (Vercel)
+  -> Supabase Edge Function "api" (production)
+       init -> planner -> searcher (Tavily) -> extractor/scorer
+       -> storage (Supabase Postgres) -> composer
+  -> Answer + scored claims + citations + trace + Looks right / Flag
+```
+
+Python reference pipeline (`backend/`, FastAPI): the same stages,
+plus H-MEM retrieval before planning, DuckDuckGo search, and the
+quote-completeness gate. It is where the sponsor integrations run
+and are tested locally.
+
 | Layer | Technology |
 |---|---|
 | Frontend | Next.js (App Router), React, Tailwind CSS, shadcn/ui — deployed on Vercel |
 | Backend (production) | Supabase Edge Function (`supabase/functions/api`, Deno) + Supabase Postgres |
-| Backend (reference) | The original Python pipeline in `backend/` (FastAPI) — same stages, kept for local development |
-| AI model | Google Gemini for planning, extraction, scoring, composition (hosted demo: `gemini-3.1-flash-lite` via the Supabase Edge Function; Python reference pipeline: `gemini-3.8-flash`) |
-| Search | Tavily API for live web sources |
+| Backend (reference) | Python pipeline in `backend/` (FastAPI) — same stages, kept for local development and sponsor testing |
+| AI model | Google Gemini for planning, extraction, scoring, composition (hosted demo: `gemini-3.1-flash-lite`; Python reference pipeline: `gemini-3.8-flash`, or Nightshift first when configured) |
+| Search | Tavily API for live web sources (hosted); DuckDuckGo (Python reference) |
+
+### Pick your way in
+
+| You want to | Do this | Time |
+|---|---|---|
+| Try it | Open https://receipts-livid.vercel.app, ask a question | 0 min |
+| Run the frontend locally | `pnpm install`, set `NEXT_PUBLIC_API_URL`, `pnpm dev` | 5 min |
+| Run the Python pipeline | `cd backend`, `pip install -r requirements.txt`, `uvicorn app:app --port 8000` | 5 min, plus API keys |
+| Run the tests | See backend/README.md; all suites are offline | 2 min |
+
+### Built when
+
+Pre-existing, Oct 17-18, 2026, declared in the submission: Next.js
+frontend, hosted Supabase Edge Function backend, original Python
+pipeline, original pitch deck.
+
+Built in the hackathon window, Oct 22-27, 2026: Meterless H-MEM
+evidence memory, Meterless Nightshift provider layer with Gemini
+fallback, Zetaris data layer with `GET /evidence/insights`,
+quote-completeness validation in both backends, test-isolation fix,
+README sponsor section, `metadata.json`, pitch deck v2, demo video.
+
+### Known limits
+
+- Live Nightshift and Zetaris runtimes are not yet installed on the
+  participant machine, so the hosted demo runs on Gemini and the
+  local insights path. Sponsor paths are built and test-covered in
+  the repo pipeline, not yet proven live.
+- The demo video v1 is pre-sponsor: no H-MEM feature, no live
+  Nightshift request.
+- The Edge Function TypeScript quote validation has no unit-test
+  harness in this repo; a live retest after redeploy is its check.
+- No Unified Semantic Layer document, DDL, or data-quality rule
+  evidence exists yet for the Zetaris scoring criteria published
+  Oct 27. That is a gap, stated in `docs/ARCHITECTURE.md`, not hidden.
 
 ## Sponsor integrations (Open Agent Hackathon)
 
@@ -82,7 +138,8 @@ runtimes are configured.
 pnpm install
 ```
 
-Create `.env.local`:
+Copy `.env.example` to `.env.local` and fill in your values
+(placeholders only in the example, no real keys):
 
 ```bash
 NEXT_PUBLIC_API_URL=https://<your-project>.supabase.co/functions/v1/api
